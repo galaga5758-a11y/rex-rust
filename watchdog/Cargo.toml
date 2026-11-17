@@ -1,0 +1,10 @@
+[package]
+name = "rex-watchdog"
+version = "1.0.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
