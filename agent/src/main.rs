@@ -520,34 +520,141 @@ fn get_network_io(prev: Option<(u64, Instant)>) -> (J, Option<(u64, Instant)>) {
 }
 
 fn get_tailscale() -> (J, String, bool) {
-    // return (peers list J, self ip, online)
+    // return (peers J, self ip4, online)
     let ts_bin = if std::path::Path::new("/usr/local/bin/tailscale").exists() { "/usr/local/bin/tailscale" } else { "tailscale" };
-    let raw = run(&format!("{} status --json 2>/dev/null", ts_bin), 5);
-    let empty = (J::Arr(vec![]), String::new(), false);
-    if raw.is_empty() { return empty; }
-    // parse minimal JSON manual (murni string scan utk field penting) — json lib tidak dipakai
-    // cukup: BackendState, Self.TailscaleIPs, Peer[].HostName/Online/CurAddr/TailscaleIPs/OS
-    // -> pakai parser mini berbasis tanda kutip
-    let mut state = String::new();
-    if let Some(p) = raw.find("\"BackendState\"") {
+    let raw = run(&format!("{} status --json 2>/dev/null", ts_bin), 6);
+    if raw.is_empty() {
+        return (J::Arr(vec![]), String::new(), false);
+    }
+    let state = json_path_str(&raw, &["BackendState"]).unwrap_or_default();
+    let mut self_ip = String::new();
+    if let Some(p) = raw.find("\"Self\"") {
         let seg = &raw[p..];
-        if let Some(c) = seg.find(':') {
-            let rest = &seg[c + 1..];
-            if let Some(q1) = rest.find('"') {
-                if let Some(q2) = rest[q1 + 1..].find('"') {
-                    state = rest[q1 + 1..q1 + 1 + q2].to_string();
-                }
+        if let Some(p2) = seg.find("\"TailscaleIPs\"") {
+            self_ip = first_ipv4_in_array(&seg[p2..]);
+        }
+    }
+    let online = state == "Running";
+    // Peer map: {"key": {...}, "key2": {...}} — split tiap VALUE object
+    let mut peers: Vec<J> = Vec::new();
+    if let Some(pp) = raw.find("\"Peer\"") {
+        let seg = &raw[pp..];
+        if let Some(brace) = seg.find('{') {
+            let inner = &seg[brace..];
+            for obj in split_objects_in_map(inner) {
+                let name = json_path_str(&obj, &["HostName"])
+                    .or_else(|| {
+                        let dns = json_path_str(&obj, &["DNSName"]).unwrap_or_default();
+                        let n = dns.split('.').next().unwrap_or("").to_string();
+                        if n.is_empty() { None } else { Some(n) }
+                    })
+                    .unwrap_or_default();
+                if name.is_empty() { continue; }
+                let ips = first_ipv4_in_array(&obj[obj.find("\"TailscaleIPs\"").unwrap_or(0)..]);
+                let online_p = json_path_bool(&obj, "Online").unwrap_or(false);
+                let direct = {
+                    let mut d = false;
+                    if let Some(p) = obj.find("\"CurAddr\"") {
+                        let rest = obj[p..].trim_start_matches("\"CurAddr\"").trim_start();
+                        if let Some(r) = rest.strip_prefix(':') {
+                            let r = r.trim_start();
+                            d = r.starts_with("\"") && !r.starts_with("\"\"");
+                        }
+                    }
+                    d
+                };
+                let relay = json_path_str(&obj, &["Relay"]);
+                let os_ = json_path_str(&obj, &["OS"]).unwrap_or_default();
+                peers.push(J::o(vec![
+                    ("name", J::s(&name)),
+                    ("ip", if ips.is_empty() { J::Null } else { J::s(&ips) }),
+                    ("os", J::s(&os_)),
+                    ("online", J::Bool(online_p)),
+                    ("direct", J::Bool(direct)),
+                    ("relay", relay.as_deref().map(J::s).unwrap_or(J::Null)),
+                ]));
             }
         }
     }
-    // scan semua blok peer utk name/ip/online/direct (dengan parser JSON mini per object)
-    let ip4 = extract_first_ipv4(&raw, "TailscaleIPs");
-    let online = state == "Running";
-    (J::Arr(vec![]), ip4, online)
+    (J::Arr(peers), self_ip, online)
 }
 
-fn extract_first_ipv4(_raw: &str, _key: &str) -> String {
-    String::new()
+// ambil IPv4 pertama dari array JSON berikutnya (["fd7a:..","100.x.y.z",...])
+fn first_ipv4_in_array(seg: &str) -> String {
+    let start = match seg.find('[') { Some(p) => p, None => return String::new() };
+    let mut cur = String::new();
+    let mut found = String::new();
+    for c in seg[start + 1..].chars().take(220) {
+        if c == ']' { break; }
+        if c == ',' || c == '"' {
+            if cur.contains('.') && !cur.contains(':') && found.is_empty() {
+                found = cur.clone();
+            }
+            cur.clear();
+            continue;
+        }
+        cur.push(c);
+    }
+    if found.is_empty() && cur.contains('.') && !cur.contains(':') {
+        found = cur;
+    }
+    found
+}
+
+// split VALUE objects dalam JSON map satu level: {"k1":{...},"k2":{...}}
+fn split_objects_in_map(inner: &str) -> Vec<String> {
+    let b = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    // skip opening brace
+    if i < b.len() && b[i] == b'{' { i += 1; }
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i] as char;
+        if in_str {
+            if c == '\\' { i += 2; continue; }
+            if c == '"' { in_str = false; }
+            i += 1;
+            continue;
+        }
+        if c == '"' { in_str = true; i += 1; continue; }
+        if c == '{' {
+            // mulai object value — scan matching brace
+            let mut depth = 0i32;
+            let mut j = i;
+            let mut s2 = false;
+            while j < b.len() {
+                let cc = b[j] as char;
+                if s2 {
+                    if cc == '\\' { j += 2; continue; }
+                    if cc == '"' { s2 = false; }
+                } else {
+                    match cc {
+                        '"' => s2 = true,
+                        '{' => depth += 1,
+                        '}' => { depth -= 1; if depth == 0 { break; } }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            let end = j.min(b.len() - 1);
+            out.push(inner[i..=end].to_string());
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    // inner dimulai dgn obj pertama (Peer map itu sendiri). Jika out[0] mencakup MAP (bukan value),
+    // parser ini menghasilkan objek2 value langsung karena kami skip key string sblm '{'.
+    out
+}
+
+fn json_path_bool(obj: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{}\": ", key);
+    let p = obj.find(&pat)?;
+    let rest = obj[p + pat.len()..].trim_start();
+    if rest.starts_with("true") { Some(true) } else if rest.starts_with("false") { Some(false) } else { None }
 }
 
 fn get_services_and_pm2() -> (Vec<J>, Vec<J>) {
