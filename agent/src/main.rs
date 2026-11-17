@@ -291,25 +291,35 @@ fn get_gpu() -> J {
     ])
 }
 
-fn cpu_stat_total() -> Option<u64> {
+#[derive(Clone, Copy, Default)]
+struct CpuTimes {
+    active: u64, // user+nice+system+irq+softirq+steal
+    total: u64,  // semua termasuk idle & iowait
+}
+
+fn cpu_stat_total() -> Option<CpuTimes> {
     let line = read_first("/proc/1/root/proc/stat");
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 5 || parts[0] != "cpu" {
         return None;
     }
-    let mut sum = 0u64;
-    for p in &parts[1..5] {
-        sum += p.parse::<u64>().unwrap_or(0);
-    }
-    Some(sum) // user+nice+system+busy approx (idle tidak masuk) → persentase "aktif"
+    // user nice system idle iowait irq softirq steal (beberapa kolom bisa absen pd kernel lama)
+    let g = |i: usize| -> u64 { parts.get(1 + i).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0) };
+    let user = g(0); let nice = g(1); let sys = g(2); let idle = g(3);
+    let iowait = g(4); let irq = g(5); let soft = g(6); let steal = g(7);
+    let active = user + nice + sys + irq + soft + steal;
+    let total = active + idle + iowait;
+    Some(CpuTimes { active, total })
 }
 
-fn cpu_usage_pct(prev: Option<(u64, Instant)>) -> Option<f64> {
+fn cpu_usage_pct(prev: Option<((u64, u64), Instant)>) -> Option<f64> {
     let now_t = cpu_stat_total()?;
     match prev {
-        Some((p, t0)) if now_t >= p && t0.elapsed().as_secs_f64() > 0.5 => {
-            let dt = t0.elapsed().as_secs_f64();
-            Some(((now_t - p) as f64 / dt).min(100.0) * 1.0)
+        Some(((pa, pt), t0)) if now_t.total > pt && t0.elapsed().as_secs_f64() > 3.0 => {
+            let dact = now_t.active as f64 - pa as f64;
+            let dtot = now_t.total as f64 - pt as f64;
+            if dtot <= 0.0 { return None; }
+            Some((dact / dtot * 100.0).clamp(0.0, 100.0))
         }
         _ => None,
     }
@@ -857,7 +867,7 @@ fn main() {
         .and_then(|v| v.parse::<u64>().ok()).unwrap_or(30).max(15);
 
     // warm-up: sample cpu/net sebelum loop pertama agar usage terisi
-    let mut cpu_prev: Option<(u64, Instant)> = cpu_stat_total().map(|t| (t, Instant::now()));
+    let mut cpu_prev: Option<((u64, u64), Instant)> = cpu_stat_total().map(|c| ((c.active, c.total), Instant::now()));
     let mut net_prev: Option<(u64, Instant)> = None;
     let mut warm = 0;
 
@@ -884,7 +894,7 @@ fn main() {
         ticks += 1;
         warm += 1;
         let cpu_pct = cpu_usage_pct(cpu_prev);
-        cpu_prev = cpu_stat_total().map(|t| (t, Instant::now()));
+        cpu_prev = cpu_stat_total().map(|c| ((c.active, c.total), Instant::now()));
         let (netio, np) = get_network_io(net_prev);
         net_prev = np;
         // loop pertama-lewat-warmup belum punya delta CPU — kirim null seperti python awal
