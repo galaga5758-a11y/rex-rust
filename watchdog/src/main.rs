@@ -83,6 +83,15 @@ fn main() {
             sysfs_write(&format!("{}/input_suspend", base), "0");
             sysfs_write(&format!("{}/charging_enabled", base), "1");
             log(&format!("resume {}% — charge dinyalakan", cap));
+        } else if cap < conf.max_charge {
+            // baterai di bawah limit: pastikan charge jalan (suspend bisa nyangkut setelah uji/reboot)
+            let susp = read_first(&format!("{}/input_suspend", base));
+            let chg_en = read_first(&format!("{}/charging_enabled", base));
+            if susp.trim() == "1" || chg_en.trim() == "0" {
+                sysfs_write(&format!("{}/input_suspend", base), "0");
+                sysfs_write(&format!("{}/charging_enabled", base), "1");
+                log(&format!("release suspend nyangkut @{}% (susp={}? chg={})", cap, susp.trim(), chg_en.trim()));
+            }
         }
 
         // ==== SAVER STAGES ====
