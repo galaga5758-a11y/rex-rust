@@ -228,9 +228,17 @@ fn get_memory() -> J {
     let sw_used = (sw_tot - sw_free).max(0);
     let gb = |kb: i64| ((kb as f64 / 1048576.0) * 100.0).round() / 100.0;
     let pct = if tot_kb > 0 { ((used_kb as f64 / tot_kb as f64) * 1000.0).round() / 10.0 } else { 0.0 };
+    // RAM "proses nyata" = total - avail - cached/buffers/sreclaimable (tanpa cache yg bisa dilepas)
+    let cache_kb = info.get("Cached").copied().unwrap_or(0)
+        + info.get("Buffers").copied().unwrap_or(0)
+        + info.get("SReclaimable").copied().unwrap_or(0);
+    let used_true_kb = (tot_kb - avail_kb - cache_kb).max(0);
+    let pct_true = if tot_kb > 0 { ((used_true_kb as f64 / tot_kb as f64) * 1000.0).round() / 10.0 } else { 0.0 };
     J::o(vec![
         ("total_gb", J::Num(gb(tot_kb))),
         ("used_gb", J::Num(gb(used_kb))),
+        ("used_true_gb", J::Num(gb(used_true_kb))),
+        ("used_true_pct", J::Num(pct_true)),
         ("avail_gb", J::Num(gb(avail_kb))),
         ("pct", J::Num(pct)),
         ("swap_total_gb", J::Num(gb(sw_tot))),
@@ -336,14 +344,18 @@ fn get_cpu(usage: Option<f64>) -> J {
             .filter(|e| e.file_name().to_string_lossy()[3..].chars().all(|c| c.is_ascii_digit()))
             .count())
         .unwrap_or(1).max(1);
-    let mut max_khz = 0i64;
+    // freq tampil = RATA-RATA core aktif (bukan max satu core — max bikin tampilan "mentok" palsu)
+    let mut sum_khz = 0i64;
+    let mut n_khz = 0i64;
     for i in 0..cores {
         let f = read_first(&format!("/proc/1/root/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", i));
-        if is_digits(&f.trim().to_string()) {
-            max_khz = max_khz.max(f.trim().parse::<i64>().unwrap_or(0));
+        let ft = f.trim().to_string();
+        if is_digits(&ft) {
+            sum_khz += ft.parse::<i64>().unwrap_or(0);
+            n_khz += 1;
         }
     }
-    let freq_mhz = if max_khz > 0 { Some(max_khz / 1000) } else { None };
+    let freq_mhz = if n_khz > 0 { Some(sum_khz / n_khz / 1000) } else { None };
     // soc temp: thermal zones host, skala adaptif seperti python
     let mut soc: Option<f64> = None;
     for z in 0..12 {
